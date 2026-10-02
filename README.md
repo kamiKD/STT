@@ -1,5 +1,7 @@
 # Speech To Text
 
+**English** · [Português (Brasil)](README.pt-BR.md)
+
 Hold `Ctrl+Alt+Space`, speak, release. The transcript is typed straight into
 whatever window you were already using — Word, Chrome, VS Code, a game chat
 box. No window switching, no clipboard dance.
