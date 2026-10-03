@@ -66,6 +66,60 @@ copiada para a área de transferência como reserva, e você pode desligar isso.
 Se você soltar a tecla sem ter falado nada audível, o app avisa e não insere
 texto solto.
 
+Enquanto o áudio é transcrito, o app lembra em que janela você estava. Se você
+trocar de janela antes da resposta, nada é digitado — a transcrição vai para a
+área de transferência e o overlay avisa. Inserir na janela que estiver na
+frente colocaria o texto no lugar errado.
+
+## A interface
+
+O cartão de estado é uma superfície arredondada, sempre no topo e que nunca
+toma foco, então ditar em outra janela não é afetado por ele.
+
+| Você faz | A pílula faz |
+| --- | --- |
+| Segura a hotkey | Aparece em 200 ms, pontos à deriva, lê-se `Listening…` |
+| Fala | Os pontos alargam e incham com a sua voz |
+| Solta | Pontos tremeluzindo ao lado de `Hearing…` |
+| A transcrição chega | O texto troca a linha, a pílula desvanece em 140 ms e some |
+| Nada resolvido | A linha diz o que deu errado (pontos âmbar) |
+
+**O material é a própria pílula.** A janela é transparente por pixel e não
+pinta nada fora da pílula, então não há moldura, halo ou margem cinza ao redor
+dela — só a pílula quase preta e sua sombra suave aparecem. (Uma versão
+anterior pedia um backdrop ao compositor, e ele vazava pela margem como uma
+moldura cinza ao redor da pílula. Foi removido exatamente por isso.)
+
+**A aparência é um style sheet só.** Cor, raio, borda, padding e tipografia
+estão declarados num único `_stylesheet()` em `stt/overlay.py`, com o fill
+compartilhado em `material.PILL_FILL` para o diálogo não escurecer diferente.
+Trocar de estado é só empurrar texto — então não existe nenhum
+`if state == ...` na renderização.
+
+**O movimento é do Qt.** O fade roda em `windowOpacity`, ou seja, é o
+compositor que desvanece, e não o widget se repintando translúcido — na ida
+*e* na volta. As transições usam `QEasingCurve`. A opção de acessibilidade do
+Windows que desliga animações é respeitada: o movimento vira uma troca
+instantânea de estado, não só um mais rápido.
+
+A única exceção deliberada são os pontos. Um `QPropertyAnimation` reinicia
+a partir do valor *inicial* sempre que o alvo muda, e o nível do microfone muda
+várias vezes por segundo — redirecionar um faz os pontos pularem em vez de
+suavizar. Então a energia da voz segue o alvo com um filtro de um pólo
+(`1 - e^(-dt/τ)`), deriva e brilho seguem um movimento que desacelera até zero
+ao sair, e um cluster assentado pula o repaint: pílula parada custa zero
+quadros. Igual a 30 fps e a 144 fps.
+
+**Dois widgets se pintam sozinhos**, porque nenhum dos dois é expressável em
+QSS: os pontos (uma órbita de pontos brancos suaves) e a etiqueta de
+transcrição (que precisa elidir em uma linha, já que o `QLabel` corta em
+silêncio e perderia o fim de uma mensagem longa sem nenhum aviso). Todo o
+resto é declarativo.
+
+O diálogo de hotkey compartilha o mesmo fill, os mesmos dois tons de destaque e
+a mesma fonte, porque um diálogo com cara de outro aplicativo é jarring
+toda vez que ele abre.
+
 ## Precisão
 
 `whisper-large-v3` com `temperature=0` é a linha de base de precisão — sem
@@ -163,10 +217,17 @@ Em ordem, o primeiro acerto vence:
 
 Só se os cinco falharem é que ele tenta o índice de pastas.
 
-O Menu Iniciar é percorrido uma vez e fica em cache por dois minutos.
-Desinstaladores, entradas de reparo e shims de console do tipo `pip` são
-ignorados, e atalhos do Menu Iniciar têm prioridade sobre `.exe` soltos achados em
-`%LOCALAPPDATA%\Programs`.
+O Windows procura o diretório atual antes do `PATH`, então o passo 2 tem uma
+regra a mais: um acerto encontrado na pasta em que o app estiver rodando nunca
+tem prioridade sobre um atalho de verdade. Ele só vira último recurso, quando
+não existe nada melhor. Sem isso, um `chrome.exe` deixado nessa pasta capturaria
+o "abra o chrome".
+
+O Menu Iniciar é percorrido uma vez e fica em cache por dois minutos, com uma
+atualização periódica em segundo plano para que o cache nunca expire — uma
+ditação não paga a varredura na thread da interface. Desinstaladores, entradas de
+reparo e shims de console do tipo `pip` são ignorados, e atalhos do Menu Iniciar
+têm prioridade sobre `.exe` soltos achados em `%LOCALAPPDATA%\Programs`.
 
 Quando um nome não resolve, o overlay avisa e oferece as correspondências mais
 próximas que achou — `Quer dizer Notepad ou WordPad?`
@@ -276,6 +337,7 @@ Bandeja → `Start with Windows` escreve em `HKCU\...\Run`. Ele lança o
 | `trailing_space` | `true` | Acrescenta espaço depois de cada inserção |
 | `type_delay_ms` | `6` | Atraso entre caracteres injetados |
 | `sample_rate` | `16000` | Taxa de captura (a nativa do Whisper) |
+| `overlay_position` | `"bottom"` | Borda da pílula: `"bottom"` ou `"top"`, centralizado (bandeja → Overlay) |
 
 Valores desconhecidos ou inválidos são reparados na leitura, então um erro de
 digitação no JSON não impede o app de iniciar. Um arquivo salvo com byte-order
@@ -292,13 +354,18 @@ Uma chave que você já configurou à mão sempre ganha da antiga.
 python -m pytest tests -q
 ```
 
-256 testes: máquina de estados da hotkey (repetição de tecla, modificadores
+350 testes: máquina de estados da hotkey (repetição de tecla, modificadores
 soltos, key-up perdido, teclas de letra com Alt, dois combos convivendo),
-reparo de config, migração de chaves antigas e tolerância a BOM, codificação
-WAV, o formato da requisição à Groq e o mapeamento de erros, roteamento de
-entrega, o guarda de silêncio, parsing de comando (abrir, fechar, pasta, URL e
-frases de sistema, em dois idiomas), resolução de app / pasta / janela, depth e
-orçamento do índice de pastas, roteamento de abertura e fechamento, o guarda da
+reparo de config, migração de chaves antigas, tolerância a BOM e escrita atômica,
+codificação WAV, o formato da requisição à Groq, o timeout proporcional ao áudio e
+o mapeamento de erros, o filtro de alucinação (marca d'água e ruído anotado
+saem, fala curta e real fica), roteamento de entrega,relato de `SendInput`
+recusado, o tratamento de `max_seconds` e a posse do stream no gravador, o
+guarda de foco durante a transcrição, a validade do cache de índices e o lock de
+escrita única, parsing de comando (abrir, fechar, pasta, URL e frases de
+sistema, em dois idiomas), resolução de app / pasta / janela, depth e
+orçamento do índice de pastas, acertos de `PATH` contra o diretório atual,
+roteamento de abertura e fechamento, o guarda da
 lista, os utilitários Win32 de janela, o codificador PNG escrito à mão, captura
 de hotkey pela bandeja, e o pipeline completo aperta → transcreve → entrega contra
 um event loop Qt de verdade.
@@ -334,10 +401,12 @@ python -c "from stt import screen; print(screen.save_screenshot())"
   então soltar o Ctrl antes encerra o hold em vez de gravar silêncio.
 - A gravação é interrompida à força em `max_seconds`, caso um key-up se perca por
   mudança de foco ou bloqueio de sessão. Um overlay travado é pior do que uma
-  ditação longa cortada.
-- Injetar em janelas elevadas (rodando como administrador) falha em silêncio a
-  partir de um processo não elevado. Suba o app como administrador se você
-  ditar em terminais ou instaladores admin.
+  ditação longa cortada. O que foi capturado ainda é transcrito.
+- Injetar em janelas elevadas (rodando como administrador) é recusado pelo Windows
+  quando o app não está elevado. O app detecta a recusa e avisa, em vez de dizer
+  que inseriu algo que nunca entrou; a transcrição fica na área de transferência
+  de qualquer forma. Suba o app como administrador se você ditar em terminais ou
+  instaladores admin.
 - Escala de DPI muito alta pode borrar o overlay; ele renderiza na resolução
   lógica que o Qt informa.
 - O Whisper transcreve fala, não intenção de formatação. Ditar "nova linha" dá
@@ -347,6 +416,9 @@ python -c "from stt import screen; print(screen.save_screenshot())"
   apelido é o caminho de entrada. Ele casa nomes, não a busca do Windows, então
   uma instalação em português ainda quer nomes de app em inglês a não ser que
   você crie apelidos.
+- A busca no `PATH` também olha o diretório atual, então um binário com o mesmo
+  nome de um app de verdade naquela pasta só entra como último recurso. Diga o
+  nome completo, ou crie um apelido, se o app escolhido for o errado.
 - Pastas são achadas até quatro níveis abaixo das suas pastas do sistema. Um
   projeto mais fundo que isso precisa de caminho explícito:
   `open folder C:\...\...\...`.

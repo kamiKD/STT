@@ -91,16 +91,48 @@ def test_close_windows_counts_the_accepted_posts(monkeypatch):
 
 
 def test_broadcast_touches_every_window(monkeypatch):
-    sent = []
+    posted = []
     monkeypatch.setattr(windows, "list_windows", lambda visible_only=True: wins_or_two())
     monkeypatch.setattr(
         windows.user32,
-        "SendMessageW",
-        lambda hwnd, msg, w, l: sent.append((_handle(hwnd), msg)),
+        "PostMessageW",
+        lambda hwnd, msg, w, l: posted.append((_handle(hwnd), msg)),
     )
     windows.broadcast(windows.APPCOMMAND_VOLUME_MUTE)
-    assert [hwnd for hwnd, _ in sent] == [10, 11]
-    assert {msg for _, msg in sent} == {windows.WM_APPCOMMAND}
+    assert [hwnd for hwnd, _ in posted] == [10, 11]
+    assert {msg for _, msg in posted} == {windows.WM_APPCOMMAND}
+
+
+def test_broadcast_posts_a_type_lparam_the_prototype_accepts(monkeypatch):
+    """The lparam has to survive ctypes' own conversion, not just the stub.
+
+    SendMessage/PostMessage declare LPARAM, which is c_longlong on 64-bit
+    builds. Passing a ctypes.c_long there raises ArgumentError, and it did:
+    every volume command raised before it reached the stub above.
+    """
+    monkeypatch.setattr(windows, "list_windows", lambda visible_only=True: wins_or_two())
+    argtypes = windows.user32.PostMessageW.argtypes
+    for command in (
+        windows.APPCOMMAND_VOLUME_MUTE,
+        windows.APPCOMMAND_VOLUME_UP,
+        windows.APPCOMMAND_VOLUME_DOWN,
+    ):
+        argtypes[3].from_param(command)  # must not raise
+
+
+def test_broadcast_does_not_block_on_a_window(monkeypatch):
+    """Post, not Send: a hung window must not stall the command."""
+    calls = []
+    monkeypatch.setattr(windows, "list_windows", lambda visible_only=True: wins_or_two())
+    monkeypatch.setattr(
+        windows.user32, "PostMessageW", lambda *a: calls.append("post")
+    )
+    monkeypatch.setattr(
+        windows.user32, "SendMessageW", lambda *a: calls.append("send")
+    )
+    windows.broadcast(windows.APPCOMMAND_VOLUME_UP)
+    assert calls == ["post", "post"]
+    assert "send" not in calls
 
 
 def wins_or_two():

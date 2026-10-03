@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -429,6 +430,11 @@ _index_stamp = 0.0
 _folder_cache: list[FolderEntry] | None = None
 _folder_stamp = 0.0
 
+# The refresher thread and the Qt thread both ask for these indexes. Without a
+# lock a command landing mid-refresh would start a second identical walk of the
+# Start Menu, doubling a multi-second build for no benefit.
+_cache_lock = threading.Lock()
+
 
 def _stale(stamp: float) -> bool:
     return time.monotonic() - stamp > INDEX_TTL
@@ -437,27 +443,30 @@ def _stale(stamp: float) -> bool:
 def cached_index() -> list[AppEntry]:
     """App index rebuilt at most every INDEX_TTL seconds; disk walking is slow."""
     global _index_cache, _index_stamp
-    if _index_cache is None or _stale(_index_stamp):
-        _index_cache = build_index()
-        _index_stamp = time.monotonic()
-    return _index_cache
+    with _cache_lock:
+        if _index_cache is None or _stale(_index_stamp):
+            _index_cache = build_index()
+            _index_stamp = time.monotonic()
+        return _index_cache
 
 
 def cached_folders() -> list[FolderEntry]:
     """One level of subdirectories under the places people keep their work."""
     global _folder_cache, _folder_stamp
-    if _folder_cache is None or _stale(_folder_stamp):
-        _folder_cache = build_folder_index()
-        _folder_stamp = time.monotonic()
-    return _folder_cache
+    with _cache_lock:
+        if _folder_cache is None or _stale(_folder_stamp):
+            _folder_cache = build_folder_index()
+            _folder_stamp = time.monotonic()
+        return _folder_cache
 
 
 def clear_cache() -> None:
     global _index_cache, _index_stamp, _folder_cache, _folder_stamp
-    _index_cache = None
-    _index_stamp = 0.0
-    _folder_cache = None
-    _folder_stamp = 0.0
+    with _cache_lock:
+        _index_cache = None
+        _index_stamp = 0.0
+        _folder_cache = None
+        _folder_stamp = 0.0
 
 
 def _walk_dirs(roots, max_depth: int, limit: int) -> list[tuple[int, str, str]]:
@@ -563,6 +572,27 @@ def suggest(target: str, names, limit: int = 3, cutoff: float = SUGGEST_CUTOFF) 
     return [display[key] for key in close]
 
 
+def _which_hit(name: str) -> tuple[str | None, bool]:
+    """shutil.which(name) -> (path, came_from_the_cwd).
+
+    On Windows shutil.which searches the cwd first, so a chrome.exe sitting in
+    whatever directory the process happens to be in shadows the real install:
+    "open chrome" would launch that copy instead of the indexed shortcut. The
+    caller downgrades such a hit to a last resort - it may still be launched
+    when nothing better exists, but it never outranks a real shortcut.
+    """
+    try:
+        hit = shutil.which(str(name))
+    except (OSError, ValueError):
+        return None, False
+    if not hit:
+        return None, False
+    absolute = os.path.abspath(hit)
+    cwd = os.path.normcase(os.path.abspath(os.getcwd()))
+    in_cwd = os.path.normcase(os.path.dirname(absolute)) == cwd
+    return absolute, in_cwd
+
+
 def resolve_app(
     name: str, *, index=None, aliases=None, min_score: float = MATCH_MIN_SCORE
 ) -> Resolution:
@@ -579,7 +609,7 @@ def resolve_app(
         for alias, value in aliases.items():
             if normalize(alias) != target:
                 continue
-            aliased = _lookup(shutil.which(str(value)), normalize(value), by_key, keys, min_score)
+            aliased = _resolve_target(value, by_key, keys, min_score)
             if aliased is None:
                 return Resolution(
                     ok=False,
@@ -588,7 +618,7 @@ def resolve_app(
                 )
             return Resolution(ok=True, name=aliased.name, target=aliased.path, kind=KIND_APP)
 
-    found = _lookup(shutil.which(target), target, by_key, keys, min_score)
+    found = _resolve_target(target, by_key, keys, min_score)
     if found is not None:
         return Resolution(ok=True, name=found.name, target=found.path, kind=KIND_APP)
     return Resolution(
@@ -597,6 +627,21 @@ def resolve_app(
         message=f'"{name}" is not installed.',
         suggestions=suggest(name, [e.name for e in entries]),
     )
+
+
+def _resolve_target(target: str, by_key, keys, min_score) -> AppEntry | None:
+    """PATH first, then the index - except a cwd binary never outranks either.
+
+    A genuine PATH hit keeps the documented priority. A hit that came from the
+    current directory is held back until the index has failed, so a planted
+    chrome.exe cannot shadow the installed one, while a tool that genuinely
+    lives nowhere else is still reachable.
+    """
+    on_path, in_cwd = _which_hit(target)
+    found = _lookup(None if in_cwd else on_path, target, by_key, keys, min_score)
+    if found is None and in_cwd:
+        found = _lookup(on_path, target, by_key, keys, min_score)
+    return found
 
 
 def _lookup(on_path, target: str, by_key, keys, min_score) -> AppEntry | None:

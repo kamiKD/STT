@@ -74,9 +74,14 @@ DEFAULTS = {
     "type_delay_ms": 6,
     # UI / system
     "overlay_enabled": True,
+    "overlay_position": "bottom",
     "start_with_windows": False,
     "sample_rate": 16000,
 }
+
+# Where the pill may sit. Centered horizontally either way; only the vertical
+# edge is a choice.
+OVERLAY_POSITIONS = ("bottom", "top")
 
 
 def app_dir() -> Path:
@@ -156,6 +161,8 @@ def _coerce(cfg: dict) -> Config:
         out["model"] = DEFAULTS["model"]
     if out["language"] not in LANGUAGES:
         out["language"] = DEFAULTS["language"]
+    if out["overlay_position"] not in OVERLAY_POSITIONS:
+        out["overlay_position"] = DEFAULTS["overlay_position"]
     out["max_seconds"] = max(5, min(600, out["max_seconds"]))
     out["type_delay_ms"] = max(0, min(100, out["type_delay_ms"]))
     out["sample_rate"] = int(out["sample_rate"]) if out["sample_rate"] in (16000, 22050, 44100, 48000) else 16000
@@ -198,12 +205,33 @@ def load_config() -> Config:
     return cfg
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """Write `text` so a reader never sees a half-written file.
+
+    config.json is rewritten on every tray toggle, so a crash or a lost power
+    mid-write used to truncate it and take every setting with it. Writing a
+    sibling .tmp and renaming it over the target is atomic on NTFS: readers see
+    either the old file or the new one, never a truncated mixture.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        # Leave no partial file behind for the next read to trip over.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def save_config(cfg: dict) -> bool:
     path = config_path()
     with _lock:
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(dict(cfg), indent=2), encoding="utf-8")
+            _atomic_write(path, json.dumps(dict(cfg), indent=2))
             return True
         except OSError:
             return False
@@ -226,8 +254,7 @@ def read_api_key() -> str:
 def write_api_key(value: str) -> bool:
     path = key_path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(value.strip(), encoding="utf-8")
+        _atomic_write(path, value.strip())
         return True
     except OSError:
         return False

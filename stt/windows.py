@@ -142,11 +142,16 @@ def broadcast(command: int) -> None:
 
     Volume keys behave like a media keyboard: the command goes to whatever is
     focused, and a broadcast is how that reaches apps that ignore the virtual
-    key codes.
+    key codes. The message is posted rather than sent, because SendMessage
+    blocks until each window answers - a single hung window would stall the
+    command for as long as it stays hung, on the thread that asked for it.
     """
     for window in list_windows(visible_only=False):
-        user32.SendMessageW(
-            wintypes.HWND(window.hwnd), WM_APPCOMMAND, 0, ctypes.c_long(command)
+        # A plain int, not a ctypes.c_long: LPARAM is c_longlong on 64-bit
+        # builds, and handing ctypes a c_long for it raises ArgumentError. The
+        # volume commands were dead on every call because of it.
+        user32.PostMessageW(
+            wintypes.HWND(window.hwnd), WM_APPCOMMAND, 0, command
         )
 
 

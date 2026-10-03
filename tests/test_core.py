@@ -62,6 +62,16 @@ def test_config_repairs_bad_values():
     assert cfg["max_seconds"] == 600
 
 
+def test_config_repairs_a_bad_overlay_position():
+    cfg = config_mod._coerce({"overlay_position": "left"})
+    assert cfg["overlay_position"] == "bottom"
+
+
+def test_config_keeps_a_valid_overlay_position():
+    cfg = config_mod._coerce({"overlay_position": "top"})
+    assert cfg["overlay_position"] == "top"
+
+
 def test_config_drops_unknown_keys():
     cfg = config_mod._coerce({"nope": 1, "auto_type": False})
     assert "nope" not in cfg
@@ -157,6 +167,46 @@ def test_config_survives_corrupt_file(tmp_path, monkeypatch):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{not json", encoding="utf-8")
     assert config_mod.load_config()["hotkey"] == list(config_mod.DEFAULTS["hotkey"])
+
+
+# ------------------------------------------------------------ atomic writes
+def test_save_leaves_no_temp_file_behind(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    config_mod.save_config(config_mod.Config(config_mod.DEFAULTS))
+    assert config_mod.config_path().exists()
+    assert list(tmp_path.rglob("*.tmp")) == []
+
+
+def test_a_failed_write_leaves_the_previous_config_intact(tmp_path, monkeypatch):
+    """config.json is rewritten on every tray toggle.
+
+    A partial write used to truncate it, which reset every setting at once.
+    """
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    good = config_mod.Config(config_mod.DEFAULTS)
+    good["language"] = "pt"
+    assert config_mod.save_config(good)
+
+    real_replace = config_mod.os.replace
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(config_mod.os, "replace", boom)
+    broken = config_mod.Config(config_mod.DEFAULTS)
+    broken["language"] = "es"
+    assert config_mod.save_config(broken) is False
+
+    monkeypatch.setattr(config_mod.os, "replace", real_replace)
+    assert config_mod.load_config()["language"] == "pt"  # untouched
+    assert list(tmp_path.rglob("*.tmp")) == []  # no debris
+
+
+def test_the_api_key_is_written_atomically_too(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    assert config_mod.write_api_key("gsk_abc")
+    assert config_mod.read_api_key() == "gsk_abc"
+    assert list(tmp_path.rglob("*.tmp")) == []
 
 
 def test_config_survives_a_byte_order_mark(tmp_path, monkeypatch):
@@ -304,8 +354,81 @@ def test_transcribe_filters_silence_hallucinations(monkeypatch):
         def json(self):
             return {"text": self._text}
 
-    monkeypatch.setattr(
-        transcribe.requests, "post", lambda *a, **k: Resp(" Thank you. ")
-    )
-    with pytest.raises(transcribe.TranscriptionError, match="No speech"):
+    for junk in (
+        " [BLANK_AUDIO] ",
+        "(silence)",
+        "[MUSIC]",
+        "Subtitles by the Amara.org community",
+        "www.amara.org",
+    ):
+        monkeypatch.setattr(
+            transcribe.requests, "post", lambda *a, _j=junk, **k: Resp(_j)
+        )
+        with pytest.raises(transcribe.TranscriptionError, match="No speech"):
+            transcribe.transcribe(b"RIFF...", api_key="gsk_x")
+
+
+@pytest.mark.parametrize(
+    "real",
+    ["Thank you.", "you", "Bye.", "You", "Thanks for watching!", "Ok."],
+)
+def test_transcribe_keeps_a_short_utterance_that_was_actually_spoken(real):
+    """A one-word dictation is not a hallucination.
+
+    These used to be dropped as junk, so dictating "thank you." came back as
+    "No speech detected." after a paid round trip. Short and common is exactly
+    what a person often says.
+    """
+    assert transcribe._strip_hallucinations(real) == real
+
+
+def test_strip_hallucinations_keeps_speech_that_mentions_a_watermark():
+    assert transcribe._strip_hallucinations("go to amara.org") == "go to amara.org"
+
+
+def test_strip_hallucinations_still_drops_empty():
+    assert transcribe._strip_hallucinations("   ") == ""
+
+
+# ------------------------------------------------------------------- timeout
+def test_timeout_scales_with_the_audio():
+    # 16 kHz mono int16 = 32000 B/s; the WAV header adds a constant 44 bytes.
+    short = transcribe.pcm_to_wav(np.zeros(2 * 16000, dtype=np.int16))
+    assert transcribe.timeout_for(short) == transcribe.MIN_TIMEOUT
+
+    two_minutes = transcribe.pcm_to_wav(np.zeros(120 * 16000, dtype=np.int16))
+    assert transcribe.timeout_for(two_minutes) == int(120 * 1.5 + 15)
+
+
+def test_timeout_is_clamped_at_both_ends():
+    assert transcribe.timeout_for(b"RIFF" * 4) == transcribe.MIN_TIMEOUT
+    huge = transcribe.pcm_to_wav(np.zeros(600 * 16000, dtype=np.int16))
+    assert transcribe.timeout_for(huge) == transcribe.MAX_TIMEOUT
+
+
+def test_transcribe_scales_the_timeout_it_sends(monkeypatch):
+    seen = {}
+
+    class Resp:
+        status_code = 200
+        ok = True
+
+        def json(self):
+            return {"text": "hello there"}
+
+    def post(*a, **k):
+        seen.update(k)
+        return Resp()
+
+    monkeypatch.setattr(transcribe.requests, "post", post)
+    transcribe.transcribe(b"RIFF..." * 100_000, api_key="gsk_x")
+    assert seen["timeout"] > transcribe.MIN_TIMEOUT
+
+
+def test_transcribe_timeout_error_reports_the_duration(monkeypatch):
+    def post(*a, **k):
+        raise transcribe.requests.Timeout()
+
+    monkeypatch.setattr(transcribe.requests, "post", post)
+    with pytest.raises(transcribe.TranscriptionError, match=r"timed out after \d+s"):
         transcribe.transcribe(b"RIFF...", api_key="gsk_x")

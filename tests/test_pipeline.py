@@ -109,6 +109,117 @@ def test_trailing_space_can_be_disabled(app, qtbot, monkeypatch):
     assert delivered[0][0] == "no space please"
 
 
+# --------------------------------------------------- focus held during typing
+@pytest.fixture
+def focus(app, monkeypatch):
+    """Pin the foreground window and let the test move it between press/release.
+
+    Transcribing takes a second or two. Without a check, switching windows in
+    that gap typed the transcript into whatever happened to be in front.
+    """
+    controller, delivered = app
+    state = {"hwnd": 1001}
+    monkeypatch.setattr(typing, "foreground_window", lambda: state["hwnd"])
+    monkeypatch.setattr(transcribe, "transcribe", lambda wav, **kw: "typed here")
+    copied = []
+    monkeypatch.setattr(
+        typing, "copy_to_clipboard", lambda text: copied.append(text) or True
+    )
+    return controller, delivered, state, copied
+
+
+def test_same_focus_inserts_as_usual(focus, qtbot):
+    controller, delivered, _state, copied = focus
+    controller._on_press()
+    _speak(controller)
+    controller._on_release()
+    _drain(qtbot)
+    assert delivered[0][0] == "typed here "
+    assert copied == []
+
+
+def test_a_window_switch_stops_the_insertion(focus, qtbot):
+    controller, delivered, state, copied = focus
+    controller._on_press()
+    state["hwnd"] = 2002  # user alt-tabbed while Groq was thinking
+    _speak(controller)
+    controller._on_release()
+    _drain(qtbot)
+
+    assert delivered == []  # nothing typed anywhere
+    assert copied == ["typed here "]  # but the text is recoverable
+    assert controller.overlay.current_state() == "error"
+
+
+def test_the_focus_check_is_reset_between_dictations(focus, qtbot):
+    """A stale hwnd must not poison the next, legitimate insertion."""
+    controller, delivered, state, _copied = focus
+    controller._on_press()
+    _speak(controller)
+    controller._on_release()
+    _drain(qtbot)
+    assert len(delivered) == 1
+
+    state["hwnd"] = 3003
+    controller._on_press()
+    _speak(controller)
+    controller._on_release()
+    _drain(qtbot)
+    assert len(delivered) == 2
+
+
+def test_an_unknown_foreground_window_is_not_treated_as_a_switch(focus, qtbot):
+    """hwnd 0 means Windows would not say; that is not a focus change."""
+    controller, delivered, state, _copied = focus
+    controller._on_press()
+    state["hwnd"] = 0
+    _speak(controller)
+    controller._on_release()
+    _drain(qtbot)
+    assert delivered[0][0] == "typed here "
+
+
+def test_a_blocked_injection_is_reported_as_a_problem(focus, qtbot, monkeypatch):
+    """SendInput refused the keystrokes: say so instead of claiming success."""
+    controller, delivered, _state, _copied = focus
+
+    def blocked(*a, **kw):
+        raise typing.InjectionBlocked("UIPI")
+
+    monkeypatch.setattr(typing, "deliver", blocked)
+    controller._on_press()
+    _speak(controller)
+    controller._on_release()
+    _drain(qtbot)
+
+    assert delivered == []
+    assert controller.overlay.current_state() == "error"
+    assert controller._busy is False
+
+
+def test_command_mode_ignores_the_focus_check(focus, qtbot, monkeypatch):
+    """Nothing is typed on this path, so the window does not matter."""
+    controller, delivered, state, copied = focus
+    ran = []
+
+    def execute(text, **kw):
+        ran.append(text)
+        return voice_command.Resolution(ok=True, name="Opened")
+
+    monkeypatch.setattr(voice_command, "execute_text", execute)
+    controller.cfg["command_with_voice"] = True
+    controller._on_press(MODE_COMMAND)
+    state["hwnd"] = 9999
+    _speak(controller)
+    controller._on_release(MODE_COMMAND)
+    _drain(qtbot)
+
+    assert ran == ["typed here"]
+    assert delivered == []
+    assert copied == []
+    assert controller.overlay.current_state() == "done"
+
+
 def test_silence_is_rejected_before_any_api_call(app, qtbot, monkeypatch):
     controller, delivered = app
     controller.cfg["min_rms"] = 0.5  # nothing will pass
@@ -367,6 +478,18 @@ def _menu_text(controller):
     return [action.text() for action in controller._menu.actions() if action.text()]
 
 
+def _all_menu_text(controller):
+    """Text of every action, including submenus."""
+    out = []
+    for action in controller._menu.actions():
+        if action.text():
+            out.append(action.text())
+        menu = action.menu()
+        if menu:
+            out.extend(a.text() for a in menu.actions() if a.text())
+    return out
+
+
 def test_tray_menu_has_command_with_voice(app):
     controller, _ = app
     assert "Command with Voice" in _menu_text(controller)
@@ -374,14 +497,18 @@ def test_tray_menu_has_command_with_voice(app):
 
 def test_tray_menu_shows_the_command_hotkey(app):
     controller, _ = app
-    assert any("Ctrl+Alt+O" in text for text in _menu_text(controller))
+    # The hotkey is no longer a disabled info row; it lives in the Hotkeys submenu.
+    assert any("Hotkeys" in text for text in _menu_text(controller))
+    all_text = _all_menu_text(controller)
+    assert "Dictation..." in all_text
+    assert "Command..." in all_text
 
 
 def test_tray_menu_has_both_hotkey_setters(app):
     controller, _ = app
-    text = _menu_text(controller)
-    assert "Set dictation hotkey..." in text
-    assert "Set command hotkey..." in text
+    text = _all_menu_text(controller)
+    assert "Dictation..." in text
+    assert "Command..." in text
 
 
 def test_tray_menu_exposes_the_system_command_toggle(app):
@@ -393,6 +520,67 @@ def test_system_toggle_persists(app):
     controller, _ = app
     controller._on_toggle_system(False)
     assert config_mod.load_config()["command_system_enabled"] is False
+
+
+def test_tray_menu_exposes_the_overlay_position(app):
+    controller, _ = app
+    assert any("Overlay:" in text for text in _menu_text(controller))
+
+
+def test_tray_menu_groups_rarely_used_settings(app):
+    """Advanced items live in a submenu, not the root."""
+    controller, _ = app
+    root = _menu_text(controller)
+    assert "Copy to clipboard as backup" not in root
+    assert "Start with Windows" not in root
+    assert "Copy last transcript" not in root
+    assert "Groq API key" not in root
+    all_text = _all_menu_text(controller)
+    assert "Copy to clipboard as backup" in all_text
+    assert "Start with Windows" in all_text
+    assert "Copy last transcript" in all_text
+    assert any("Groq API key" in t for t in all_text)
+
+
+def test_tray_menu_has_no_disabled_info_rows(app):
+    """Disabled info rows waste space; the tray tooltip carries the hotkey."""
+    controller, _ = app
+    assert not any("Hold" in text and "dictate" in text for text in _menu_text(controller))
+
+
+def test_overlay_position_pick_persists_and_moves_the_pill(app):
+    controller, _ = app
+    controller._on_pick_position("top")
+    assert config_mod.load_config()["overlay_position"] == "top"
+    assert controller.overlay._position == "top"
+    controller._on_pick_position("bottom")
+    assert config_mod.load_config()["overlay_position"] == "bottom"
+    assert controller.overlay._position == "bottom"
+
+
+def test_overlay_position_pick_ignores_garbage(app):
+    controller, _ = app
+    controller._on_pick_position("top")
+    controller._on_pick_position("left")
+    assert config_mod.load_config()["overlay_position"] == "top"
+    assert controller.overlay._position == "top"
+    controller._on_pick_position("bottom")
+
+
+def test_the_app_applies_the_saved_position_on_startup(cfg, qtbot, monkeypatch):
+    """A restart must honour the choice, not reset to the default."""
+    from stt.app import App
+
+    cfg["overlay_position"] = "top"
+    controller = App(cfg)
+    qtbot.addWidget(controller.overlay)
+    controller.listener.stop()
+    if controller.command_listener is not None:
+        controller.command_listener.stop()
+    try:
+        assert controller.overlay._position == "top"
+    finally:
+        controller.shutdown()
 
 
 def test_command_toggle_starts_and_stops_the_second_listener(app):
@@ -408,6 +596,18 @@ def test_command_toggle_persists(app, cfg):
     controller, _ = app
     controller._on_toggle_command(False)
     assert config_mod.load_config()["command_with_voice"] is False
+
+
+# ------------------------------------------------------- hotkey from the tray
+def test_the_index_refresher_outruns_the_cache_ttl():
+    """The whole point: the cache must never expire between two commands.
+
+    If the interval were at or above INDEX_TTL, the next voice command would
+    rebuild the Start Menu index on the Qt thread - a multi-second freeze.
+    """
+    from stt.app import INDEX_REFRESH_MS
+
+    assert 0 < INDEX_REFRESH_MS < voice_command.INDEX_TTL * 1000
 
 
 # ------------------------------------------------------- hotkey from the tray
@@ -458,7 +658,9 @@ def test_tray_hotkey_rebinding_updates_the_menu(app, fake_dialog):
     controller, _ = app
     fake_dialog.combo_to_return = ["ctrl", "shift", "m"]
     controller._on_edit_hotkey("hotkey")
-    assert controller._menu.actions()[0].text() == "Hold Ctrl+Shift+M to dictate"
+    # The menu is rebuilt; the hotkey is no longer a disabled info row.
+    assert not any("Hold" in text and "dictate" in text for text in _menu_text(controller))
+    assert controller._menu.actions(), "menu should have actions"
 
 
 def test_tray_command_hotkey_rebinds_the_second_listener(app, fake_dialog):
@@ -468,7 +670,8 @@ def test_tray_command_hotkey_rebinds_the_second_listener(app, fake_dialog):
 
     assert controller.cfg["command_hotkey"] == ["ctrl", "win", "j"]
     assert controller.command_listener.label == "Ctrl+Win+J"
-    assert any("Ctrl+Win+J" in text for text in _menu_text(controller))
+    # The hotkey is no longer shown as text in the menu.
+    assert not any("Ctrl+Win+J" in text for text in _menu_text(controller))
 
 
 def test_tray_hotkey_cancel_changes_nothing(app, fake_dialog):

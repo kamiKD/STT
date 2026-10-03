@@ -7,10 +7,11 @@ Key events are synthesized: QTest would need a real window handle, and
 from __future__ import annotations
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEventLoop, Qt, QTimer
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QDialog
 
+from stt import material
 from stt.hotkey_dialog import HotkeyDialog
 
 pytest.importorskip("pytestqt")
@@ -91,6 +92,26 @@ def test_dialog_shows_the_current_binding(qtbot):
     dialog = HotkeyDialog("Hotkey", "Press it", ["ctrl", "alt", "space"])
     qtbot.addWidget(dialog)
     assert "Ctrl+Alt+Space" in dialog._preview.text()
+
+
+def test_dialog_fades_in(qtbot):
+    """The dialog must appear with a fade, not pop into existence."""
+    dialog = HotkeyDialog("Hotkey", "Press it")
+    qtbot.addWidget(dialog)
+    dialog.show()
+    assert dialog.windowOpacity() < 1.0
+    loop = QEventLoop()
+    QTimer.singleShot(400, loop.quit)
+    loop.exec()
+    assert dialog.windowOpacity() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_dialog_fade_in_is_skipped_with_reduced_motion(qtbot, monkeypatch):
+    monkeypatch.setattr(material, "reduced_motion", lambda: True)
+    dialog = HotkeyDialog("Hotkey", "Press it")
+    qtbot.addWidget(dialog)
+    dialog.show()
+    assert dialog.windowOpacity() == pytest.approx(1.0, abs=1e-6)
 
 
 def test_dialog_tracks_modifiers_pressed_one_by_one(qtbot):

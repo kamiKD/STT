@@ -129,7 +129,7 @@ def _send_vk(vk: int, up: bool = False) -> None:
     user32.keybd_event(vk, 0, flags, 0)
 
 
-def _send_unicode_char(ch: str) -> None:
+def _send_unicode_char(ch: str) -> bool:
     code = ord(ch)
     if code > 0xFFFF:  # surrogate pair
         code -= 0x10000
@@ -141,7 +141,18 @@ def _send_unicode_char(ch: str) -> None:
             inp = _INPUT()
             inp.type = INPUT_KEYBOARD
             inp.ki = _KEYBDINPUT(0, unit, KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if is_up else 0), 0, 0)
-            user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+            if user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT)) != 1:
+                return False
+    return True
+
+
+class InjectionBlocked(RuntimeError):
+    """SendInput was refused, so nothing reached the focused window.
+
+    Almost always the UIPI boundary: the target window runs elevated and this
+    process does not. Reporting it beats telling the user a transcript was
+    inserted when the window never saw a key.
+    """
 
 
 def foreground_window() -> int:
@@ -153,15 +164,21 @@ def focused_window() -> int:
 
 
 def type_text(text: str, delay_ms: int = 6) -> None:
-    """Type text into the focused window using synthetic Unicode keystrokes."""
+    """Type text into the focused window using synthetic Unicode keystrokes.
+
+    Raises InjectionBlocked when Windows refuses the input, instead of
+    reporting a dictation that never landed.
+    """
     delay = max(0, delay_ms) / 1000.0
     for ch in text:
         if ch == "\n":
             _send_vk(0x0D)  # VK_RETURN types better than a raw \n in most apps
         elif ch == "\t":
             _send_vk(0x09)
-        else:
-            _send_unicode_char(ch)
+        elif not _send_unicode_char(ch):
+            raise InjectionBlocked(
+                "SendInput was rejected by the focused window (UIPI)"
+            )
         if delay:
             time.sleep(delay)
 

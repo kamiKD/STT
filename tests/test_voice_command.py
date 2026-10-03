@@ -7,6 +7,7 @@ window list and the system table are all injected.
 from __future__ import annotations
 
 import os
+import threading
 
 import pytest
 
@@ -248,6 +249,69 @@ def test_suggest_keeps_display_case():
 def test_resolve_app_prefers_path_hits(index, monkeypatch):
     monkeypatch.setattr(voice_command.shutil, "which", lambda name: r"C:\tools\notepad.exe")
     assert voice_command.resolve_app("notepad", index=index).target == r"C:\tools\notepad.exe"
+
+
+# ------------------------------------------------- PATH lookup vs the cwd
+def test_a_binary_in_the_cwd_cannot_shadow_an_installed_app(index, monkeypatch, tmp_path):
+    """On Windows shutil.which searches the cwd first.
+
+    That made "open chrome" launch a chrome.exe sitting in whatever directory
+    the process happened to be in, instead of the indexed shortcut.
+    """
+    monkeypatch.chdir(tmp_path)
+    planted = tmp_path / "chrome.exe"
+    planted.write_bytes(b"")
+    monkeypatch.setattr(voice_command.shutil, "which", lambda name: str(planted))
+
+    result = voice_command.resolve_app("chrome", index=index)
+    assert result.ok
+    assert result.target == r"C:\menu\Google Chrome.lnk"
+
+
+def test_a_bare_name_hit_is_treated_as_a_cwd_hit(index, monkeypatch, tmp_path):
+    """which() can answer with no directory at all; that is a cwd hit too."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(voice_command.shutil, "which", lambda name: "chrome.EXE")
+    assert (
+        voice_command.resolve_app("chrome", index=index).target
+        == r"C:\menu\Google Chrome.lnk"
+    )
+
+
+def test_a_real_path_hit_outside_the_cwd_still_wins(index, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        voice_command.shutil, "which", lambda name: r"C:\tools\chrome.exe"
+    )
+    assert voice_command.resolve_app("chrome", index=index).target == r"C:\tools\chrome.exe"
+
+
+def test_an_alias_cannot_reach_a_cwd_binary(index, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    planted = tmp_path / "chrome.exe"
+    planted.write_bytes(b"")
+    monkeypatch.setattr(voice_command.shutil, "which", lambda name: str(planted))
+    result = voice_command.resolve_app(
+        "browser", index=index, aliases={"browser": "chrome"}
+    )
+    assert result.target == r"C:\menu\Google Chrome.lnk"
+
+
+def test_the_cwd_hit_is_not_swallowed_when_nothing_else_matches(
+    no_index, monkeypatch, tmp_path
+):
+    """With no shortcut to fall back on, the hit is still better than nothing."""
+    monkeypatch.chdir(tmp_path)
+    planted = tmp_path / "mytool.exe"
+    planted.write_bytes(b"")
+    monkeypatch.setattr(voice_command.shutil, "which", lambda name: str(planted))
+    result = voice_command.resolve_app("mytool", index=[])
+    assert result.ok and result.target == str(planted)
+
+
+@pytest.fixture
+def no_index():
+    return []
 
 
 def test_resolve_app_uses_an_alias(index, no_path):
@@ -649,3 +713,56 @@ def test_launch_uses_the_shell(monkeypatch):
 def test_text_module_is_the_single_normalizer():
     assert text.normalize("Open  Chrome!") == "open chrome"
     assert text.strip_accents("Música") == "Musica"
+
+
+# ------------------------------------------------------------ index caching
+def test_a_fresh_cache_is_not_rebuilt(monkeypatch):
+    builds = []
+    monkeypatch.setattr(voice_command, "build_index", lambda: builds.append(1) or [])
+    voice_command.clear_cache()
+    voice_command.cached_index()
+    voice_command.cached_index()
+    assert len(builds) == 1
+    voice_command.clear_cache()
+
+
+def test_an_expired_cache_is_rebuilt(monkeypatch):
+    builds = []
+    monkeypatch.setattr(voice_command, "build_index", lambda: builds.append(1) or [])
+    voice_command.clear_cache()
+    voice_command.cached_index()
+    voice_command._index_stamp -= voice_command.INDEX_TTL + 1
+    voice_command.cached_index()
+    assert len(builds) == 2
+    voice_command.clear_cache()
+
+
+def test_the_refresher_and_a_command_never_build_at_the_same_time(monkeypatch):
+    """Both threads ask for the index; only one walk should happen.
+
+    build_index() measured over 2s on a real machine. A voice command landing
+    while the refresher was mid-walk used to start a second identical walk,
+    doubling that stall.
+    """
+    active = {"n": 0, "peak": 0}
+    gate = threading.Event()
+
+    def slow_build():
+        active["n"] += 1
+        active["peak"] = max(active["peak"], active["n"])
+        gate.wait(2)
+        active["n"] -= 1
+        return []
+
+    monkeypatch.setattr(voice_command, "build_index", slow_build)
+    voice_command.clear_cache()
+
+    worker = threading.Thread(target=voice_command.cached_index)
+    worker.start()
+    gate.wait(0.2)  # the walk is in flight
+    voice_command.cached_index()  # the command path must wait, not duplicate
+    gate.set()
+    worker.join(5)
+
+    assert active["peak"] == 1
+    voice_command.clear_cache()

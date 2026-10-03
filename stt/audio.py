@@ -16,6 +16,11 @@ import sounddevice as sd
 
 BLOCK = 1024
 
+# How far past max_seconds the buffer may grow. The caller's timer stops the
+# recorder at max_seconds, so this is never reached in practice; it exists only
+# so a wedged timer cannot grow the buffer without bound.
+MEMORY_SLACK_SECONDS = 10
+
 
 class Recorder:
     """Single-channel 16 kHz mono recorder with a live level meter."""
@@ -29,11 +34,22 @@ class Recorder:
         self._stream: sd.RawInputStream | None = None
         self._levels: deque[float] = deque(maxlen=40)
         self._active = False
+        self._truncated = False
+        self._frozen = False
+        self._frames_cap = self._hard_cap()
+
+    def _hard_cap(self) -> int:
+        return self.sample_rate * (self.max_seconds + MEMORY_SLACK_SECONDS)
 
     # ------------------------------------------------------------------ state
     @property
     def is_recording(self) -> bool:
         return self._active
+
+    @property
+    def truncated(self) -> bool:
+        """True once the recording ran into the max_seconds limit."""
+        return self._truncated
 
     def level(self) -> float:
         """Smoothed RMS in 0..1, for the overlay waveform."""
@@ -75,6 +91,9 @@ class Recorder:
             self._frames = 0
             self._levels.clear()
             self._active = True
+            self._truncated = False
+            self._frozen = False
+            self._frames_cap = self._hard_cap()
             try:
                 stream = sd.RawInputStream(
                     samplerate=self.sample_rate,
@@ -105,6 +124,8 @@ class Recorder:
             self._active = False
             chunks = self._chunks
             self._chunks = []
+            self._truncated = False
+            self._frozen = False
         if not chunks:
             return np.zeros(0, dtype=np.int16)
         return np.concatenate(chunks)
@@ -118,11 +139,22 @@ class Recorder:
             return
         block = np.frombuffer(indata, dtype=np.int16).copy()
         with self._lock:
+            if self._frozen:
+                return
             self._chunks.append(block)
             self._frames += len(block)
-        self._levels.append(self._rms(block))
-        if self._frames >= self.sample_rate * self.max_seconds:
-            self._active = False  # caller notices via is_recording
+            self._levels.append(self._rms(block))
+            if self._frames >= self.sample_rate * self.max_seconds:
+                # Past the limit: flag it, but keep recording and keep owning
+                # the stream. Clearing _active here used to orphan an open
+                # RawInputStream (nothing would ever close it) and threw away
+                # the whole take, because the caller's max timer keys off
+                # is_recording. stop() is the only thing that closes a stream.
+                self._truncated = True
+            if self._frames >= self._frames_cap:
+                # Backstop for a wedged caller timer: stop growing the buffer,
+                # stay active so stop() still runs and still frees the device.
+                self._frozen = True
 
     @staticmethod
     def _rms(block: np.ndarray) -> float:

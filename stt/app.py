@@ -30,12 +30,20 @@ from .overlay import RecordingOverlay
 
 IDLE_HIDE_MS = 3500
 
+# How often the voice-command indexes are rebuilt in the background. Kept well
+# inside voice_command.INDEX_TTL so the cache never expires: build_index()
+# measured over 2s on a real machine, and paying that on the Qt thread would
+# freeze the overlay for as long as it took.
+INDEX_REFRESH_MS = max(30_000, int(voice_command.INDEX_TTL * 1000 / 2))
+
 MODE_DICTATE = "dictate"
 MODE_COMMAND = "command"
 
+# Tray colours. The same iOS system accents the card uses, so the tray icon and
+# the overlay read as one system instead of two that happen to be in one app.
 TRAY_BODY = {
-    MODE_DICTATE: ("#ff5c5c", "#3c3f4b"),
-    MODE_COMMAND: ("#7aa2ff", "#3c4a6b"),
+    MODE_DICTATE: ("#ff453a", "#5a5c66"),
+    MODE_COMMAND: ("#0a84ff", "#5a5c66"),
 }
 
 
@@ -88,6 +96,7 @@ class App:
             sample_rate=cfg["sample_rate"], max_seconds=cfg["max_seconds"]
         )
         self.overlay = RecordingOverlay()
+        self.overlay.set_position(cfg.get("overlay_position", "bottom"))
         self.bridge = _HotkeyBridge()
         self.result = _ResultBridge()
         self._thread: threading.Thread | None = None
@@ -95,6 +104,7 @@ class App:
         self._mode = MODE_DICTATE
         self._capturing = False
         self._last_text = ""
+        self._target_hwnd = 0
 
         self.bridge.pressed.connect(self._on_press, Qt.ConnectionType.QueuedConnection)
         self.bridge.released.connect(self._on_release, Qt.ConnectionType.QueuedConnection)
@@ -151,24 +161,13 @@ class App:
 
     def _rebuild_menu(self) -> None:
         menu = QMenu()
-        label = keyutil.combo_label(self.cfg["hotkey"])
-        info = menu.addAction(f"Hold {label} to dictate")
-        info.setEnabled(False)
-        menu.addSeparator()
 
+        # Core toggles — the ones most likely to be flipped in a session.
         toggle = QAction("Enabled", menu)
         toggle.setCheckable(True)
         toggle.setChecked(self.cfg["auto_type"])
         toggle.toggled.connect(self._on_toggle_enabled)
         menu.addAction(toggle)
-
-        backup = QAction("Copy to clipboard as backup", menu)
-        backup.setCheckable(True)
-        backup.setChecked(self.cfg["clipboard_backup"])
-        backup.toggled.connect(self._on_toggle_backup)
-        menu.addAction(backup)
-
-        menu.addSeparator()
 
         voice = QAction("Command with Voice", menu)
         voice.setCheckable(True)
@@ -176,28 +175,25 @@ class App:
         voice.toggled.connect(self._on_toggle_command)
         menu.addAction(voice)
 
-        command_label = keyutil.combo_label(self.cfg["command_hotkey"])
-        voice_hint = menu.addAction(
-            f'Hold {command_label} - "open X", "close X", "lock the screen"'
-        )
-        voice_hint.setEnabled(False)
-
         system = QAction("Allow system commands", menu)
         system.setCheckable(True)
         system.setChecked(bool(self.cfg["command_system_enabled"]))
         system.toggled.connect(self._on_toggle_system)
         menu.addAction(system)
 
-        set_command = QAction("Set command hotkey...", menu)
-        set_command.triggered.connect(lambda: self._on_edit_hotkey("command_hotkey"))
-        menu.addAction(set_command)
-
-        set_dictate = QAction("Set dictation hotkey...", menu)
-        set_dictate.triggered.connect(lambda: self._on_edit_hotkey("hotkey"))
-        menu.addAction(set_dictate)
-
         menu.addSeparator()
 
+        # Hotkeys grouped: two entries that are only touched when rebinding.
+        hotkeys = menu.addMenu("Hotkeys")
+        set_dictate = QAction("Dictation...", hotkeys)
+        set_dictate.triggered.connect(lambda: self._on_edit_hotkey("hotkey"))
+        hotkeys.addAction(set_dictate)
+        set_command = QAction("Command...", hotkeys)
+        set_command.triggered.connect(lambda: self._on_edit_hotkey("command_hotkey"))
+        hotkeys.addAction(set_command)
+
+        # Model and language: the two settings that change how transcription
+        # behaves, grouped together.
         model_menu = menu.addMenu(f"Model: {self.cfg['model']}")
         for name in config_mod.MODELS:
             act = model_menu.addAction(name)
@@ -214,20 +210,39 @@ class App:
             act.setChecked(code == self.cfg["language"])
             act.triggered.connect(lambda _c=False, c=code: self._on_pick_language(c))
 
-        key_state = config_mod.mask_key(self.api_key)
-        key_act = menu.addAction(f"Groq API key: {key_state}")
-        key_act.triggered.connect(self._on_set_key)
+        pos_labels = {"bottom": "Bottom center", "top": "Top center"}
+        current_pos = pos_labels.get(self.cfg["overlay_position"], "Bottom center")
+        pos_menu = menu.addMenu(f"Overlay: {current_pos}")
+        for where in config_mod.OVERLAY_POSITIONS:
+            act = pos_menu.addAction(pos_labels[where])
+            act.setCheckable(True)
+            act.setChecked(where == self.cfg["overlay_position"])
+            act.triggered.connect(lambda _c=False, w=where: self._on_pick_position(w))
 
         menu.addSeparator()
-        autostart = QAction("Start with Windows", menu)
+
+        # Advanced: everything that is set once and rarely touched.
+        advanced = menu.addMenu("Advanced")
+        backup = QAction("Copy to clipboard as backup", advanced)
+        backup.setCheckable(True)
+        backup.setChecked(self.cfg["clipboard_backup"])
+        backup.toggled.connect(self._on_toggle_backup)
+        advanced.addAction(backup)
+
+        autostart = QAction("Start with Windows", advanced)
         autostart.setCheckable(True)
         autostart.setChecked(self._is_autostart_enabled())
         autostart.toggled.connect(self._on_toggle_autostart)
-        menu.addAction(autostart)
+        advanced.addAction(autostart)
 
-        copy_last = QAction("Copy last transcript", menu)
+        copy_last = QAction("Copy last transcript", advanced)
         copy_last.triggered.connect(self._on_copy_last)
-        menu.addAction(copy_last)
+        advanced.addAction(copy_last)
+
+        key_state = config_mod.mask_key(self.api_key)
+        key_act = QAction(f"Groq API key: {key_state}", advanced)
+        key_act.triggered.connect(self._on_set_key)
+        advanced.addAction(key_act)
 
         menu.addSeparator()
         quit_act = QAction("Quit", menu)
@@ -256,8 +271,11 @@ class App:
     def _warm_indexes() -> None:
         """Walk the Start Menu and the folder tree before anyone asks.
 
-        Both walks cost a fraction of a second, which is long enough to freeze
-        the overlay if the first spoken command pays for it on the Qt thread.
+        Both walks cost a fraction of a second - and build_index() measured
+        over 2s on a real machine - which is far too long to freeze the overlay
+        if the first spoken command pays for it on the Qt thread. The periodic
+        refresher below keeps both caches inside their TTL so the command path
+        never has to rebuild.
         """
         def warm() -> None:
             try:
@@ -292,6 +310,11 @@ class App:
             self.overlay.schedule_hide(5000)
             return
         self._mode = mode
+        # Remember where the text has to land. Transcribing takes a second or
+        # two, and the user may well switch windows in the meantime; typing
+        # into whatever holds focus at delivery time puts the transcript in a
+        # terminal or a game instead of where they were dictating.
+        self._target_hwnd = typing.foreground_window()
         self.tray.setIcon(_tray_icon(True, mode))
         if mode == MODE_COMMAND:
             hint = 'Say "open Chrome", "close Notepad" or "lock the screen".'
@@ -373,11 +396,35 @@ class App:
         # A trailing space keeps consecutive dictations from running together.
         payload = text + " " if self.cfg["trailing_space"] else text
 
-        method = typing.deliver(
-            payload,
-            delay_ms=self.cfg["type_delay_ms"],
-            clipboard_backup=self.cfg["clipboard_backup"],
-        )
+        target, self._target_hwnd = self._target_hwnd, 0
+        current = typing.foreground_window()
+        if target and current and current != target:
+            # Focus moved while Groq was thinking. Inserting now would put the
+            # text somewhere the user did not ask for, so leave it on the
+            # clipboard and say so; nothing is typed anywhere.
+            typing.copy_to_clipboard(payload)
+            self.overlay.set_state(
+                "error",
+                "Focus moved while transcribing - nothing was typed. "
+                "The transcript is on your clipboard.",
+            )
+            self.overlay.schedule_hide(5000)
+            return
+
+        try:
+            method = typing.deliver(
+                payload,
+                delay_ms=self.cfg["type_delay_ms"],
+                clipboard_backup=self.cfg["clipboard_backup"],
+            )
+        except typing.InjectionBlocked:
+            self.overlay.set_state(
+                "error",
+                "Windows refused the keystrokes. The target window is probably "
+                "running elevated - start this app elevated to dictate into it.",
+            )
+            self.overlay.schedule_hide(6000)
+            return
         self.overlay.set_state("done", f"Inserted ({method}): {text}")
         self.overlay.schedule_hide()
 
@@ -487,6 +534,16 @@ class App:
         self.cfg.save()
         self._rebuild_menu()
 
+    def _on_pick_position(self, where: str) -> None:
+        if where not in config_mod.OVERLAY_POSITIONS:
+            return
+        self.cfg["overlay_position"] = where
+        self.cfg.save()
+        # Moves at once when the pill is on screen; otherwise it applies on
+        # the next show, which repositions every time.
+        self.overlay.set_position(where)
+        self._rebuild_menu()
+
     def _on_copy_last(self) -> None:
         if self._last_text:
             typing.copy_to_clipboard(self._last_text)
@@ -582,12 +639,23 @@ def run(cfg: config_mod.Config | None = None) -> int:
     # Feed the overlay's level meter while recording. Parented to the bridge so
     # it is torn down with the app.
     meter = QTimer(controller.bridge)
-    meter.setInterval(50)
+    # ~60 Hz. The card's level ring eases toward what arrives here, and 20 Hz
+    # reads as a stuttering meter rather than a live one.
+    meter.setInterval(16)
     meter.timeout.connect(
         lambda: controller.overlay.set_level(controller.recorder.level())
     )
     meter.start()
     app._stt_meter = meter
+
+    # Refresh the voice-command indexes well inside their TTL. Without this the
+    # cache expires between two commands and the next one rebuilds the whole
+    # Start Menu index on the Qt thread, stalling the overlay while it does.
+    refresher = QTimer(controller.bridge)
+    refresher.setInterval(INDEX_REFRESH_MS)
+    refresher.timeout.connect(controller._warm_indexes)
+    refresher.start()
+    app._stt_refresher = refresher
 
     app.aboutToQuit.connect(controller.shutdown)
     controller.start()

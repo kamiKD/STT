@@ -66,6 +66,61 @@ a backup you can toggle off.
 If you release the key without saying anything audible, the app says so and
 does not insert stray text.
 
+While the audio is being transcribed, the app remembers which window you were
+in. If you switch windows before it comes back, nothing is typed — the
+transcript goes to the clipboard and the overlay says what happened. Inserting
+into whatever happens to be in front would put your text in the wrong window.
+
+## The interface
+
+The status card is a rounded, always-on-top surface that never takes focus, so
+dictating into another window is unaffected by it.
+
+| You do | The card does |
+| --- | --- |
+| Hold the hotkey | Fades up over 200 ms, dots drift, pill reads `Listening…` |
+| Speak | The dots widen and swell with your voice |
+| Let go | Dots keep shimmering beside `Hearing…` |
+| Transcript arrives | The transcript replaces the line, pill hides after a moment |
+| Nothing resolved | The line says what went wrong |
+
+**The material is the pill itself.** The window is per-pixel transparent and
+paints nothing outside the pill, so there is no frame, no halo and no gray
+margin around it — only the near-black pill and its soft shadow are ever
+visible. (An earlier version asked the compositor for a system backdrop, and
+the backdrop showed through the window margin as a gray frame around the
+pill. It was removed for exactly that reason.)
+
+**The look is one style sheet.** Colour, radius, border, padding and type are
+declared in a single `_stylesheet()` in `stt/overlay.py`, with the pill fill
+shared from `material.PILL_FILL` so the dialog cannot drift apart in darkness.
+Switching state is still just pushing text — so there are no
+`if state == ...` branches anywhere in the rendering.
+
+**Motion is Qt's.** The fade runs on `windowOpacity`, which means the
+compositor does the fading rather than the widget repainting itself
+translucent — in *and* out. Transitions use `QEasingCurve`. Windows' own
+"turn off animations" accessibility setting is honoured: motion collapses to an
+instant state change rather than merely getting faster.
+
+The one deliberate exception is the dot cluster. A `QPropertyAnimation`
+restarts from its *start* value whenever the target changes, and a microphone
+level changes several times a second — retargeting one makes the dots jump
+from zero instead of easing. So voice energy follows its target with a one-pole
+filter (`1 - e^(-dt/τ)`), drift and brightness scale with a motion amount that
+coasts to zero on leaving, and a settled cluster skips its repaint entirely:
+a static pill costs zero frames. Frame-rate independent, exact on target, same
+at 30 fps and at 144 fps.
+
+**Two widgets paint themselves**, because neither is expressible in QSS: the
+dot cluster and the transcript label (which has to elide, since
+`QLabel` clips silently and would drop the end of a long message with nothing
+to show for it). Everything else is declarative.
+
+The rebind dialog shares the same fill, the same two accent hues and the
+same type face, because a dialog that looks like a different application is
+jarring every time it opens.
+
 ## Accuracy settings
 
 `whisper-large-v3` at `temperature=0` is the accuracy baseline — no sampling,
@@ -161,6 +216,12 @@ In order, first hit wins:
    asking again.
 
 Only if all five miss does it try the folder index.
+
+Windows searches the current directory before `PATH`, so step 2 is held to one
+extra rule: a hit found in the folder the app happens to be running from never
+outranks a real shortcut. It is only used as a last resort, when nothing better
+exists. Otherwise a `chrome.exe` dropped in that folder would capture
+"open chrome".
 
 The Start Menu is walked once and cached for two minutes. Uninstallers,
 repair entries and `pip`-style console shims are skipped, and Start Menu
@@ -269,6 +330,7 @@ when available so nothing flashes a console at login.
 | `trailing_space` | `true` | Append a space after each insertion |
 | `type_delay_ms` | `6` | Delay between injected characters |
 | `sample_rate` | `16000` | Capture rate (Whisper's native rate) |
+| `overlay_position` | `"bottom"` | Pill edge: `"bottom"` or `"top"` center (tray → Overlay) |
 
 Unknown or invalid values are repaired on load, so a typo in the JSON will not
 stop the app from starting. A file saved with a byte-order mark (what Notepad
@@ -285,15 +347,19 @@ already set by hand always wins over the legacy one.
 python -m pytest tests -q
 ```
 
-256 tests: hotkey state machine (key repeat, stray modifiers, lost key-ups,
+350 tests: hotkey state machine (key repeat, stray modifiers, lost key-ups,
 Alt-modified letter keys, two coexisting combos), config repair, legacy-key
-migration and BOM tolerance, WAV encoding, the Groq request shape and error
-mapping, delivery routing, the silence guard, command parsing (open, close,
-folder, URL and system phrases, in two languages), app / folder / window
-resolution, folder index depth and budget, launch and close routing, the
-whitelist guard, the Win32 window helpers, the hand-rolled PNG encoder, hotkey
-capture from the tray, and the full press → transcribe → deliver pipeline
-against a real Qt event loop.
+migration, BOM tolerance and atomic writes, WAV encoding, the Groq request
+shape, timeout scaling and error mapping, hallucination filtering (watermarks
+and bracketed noise out, real short utterances kept), delivery routing, refused
+`SendInput` reporting, the recorder's `max_seconds` handling and stream
+ownership, the focus guard across a transcription, index cache freshness and
+single-writer locking, command parsing (open, close, folder, URL and system
+phrases, in two languages), app / folder / window resolution, folder index
+depth and budget, `PATH` hits versus the current directory, launch and close
+routing, the whitelist guard, the Win32 window helpers, the hand-rolled PNG
+encoder, hotkey capture from the tray, and the full press → transcribe →
+deliver pipeline against a real Qt event loop.
 
 The pipeline tests need a Qt platform plugin. On a headless machine:
 
@@ -325,9 +391,14 @@ python -c "from stt import screen; print(screen.save_screenshot())"
   lifting Ctrl early ends the hold rather than recording silence.
 - A recording is force-stopped at `max_seconds` in case a key-up is lost to a
   focus change or session lock. A stuck overlay is worse than a long dictation
-  being cut.
-- Injecting into elevated windows (running as administrator) fails silently
-  from a non-elevated process. Start the app elevated if you dictate into
+  being cut. Whatever was captured is still transcribed.
+- The `PATH` lookup runs against the current directory too, so a binary
+  sharing a name with a real app in that folder is a last resort only. Say the
+  full name, or add an alias, if the wrong one is picked.
+- Injecting into elevated windows (running as administrator) is refused by
+  Windows when this app is not elevated. The app detects the refusal and says
+  so instead of reporting an insertion that never happened; the transcript is
+  on your clipboard either way. Start the app elevated if you dictate into
   admin terminals or installers.
 - Very high DPI scaling can blur the overlay; it renders at the logical
   resolution Qt reports.

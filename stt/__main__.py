@@ -18,6 +18,10 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--language", help="language code, or 'auto'")
     parser.add_argument("--model", choices=config_mod.MODELS)
+    parser.add_argument(
+        "--overlay-position", choices=config_mod.OVERLAY_POSITIONS,
+        help="where the pill appears: bottom or top center",
+    )
     parser.add_argument("--no-tray", action="store_true", help="run without a tray icon")
     parser.add_argument(
         "--check", action="store_true", help="print diagnostics and exit"
@@ -57,6 +61,8 @@ def main(argv=None) -> int:
         cfg["language"] = args.language
     if args.model:
         cfg["model"] = args.model
+    if args.overlay_position:
+        cfg["overlay_position"] = args.overlay_position
     cfg.save()
 
     if args.check:
